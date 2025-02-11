@@ -1,0 +1,12 @@
+[package]
+name = "rust_dns_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+dns-parser = "0.8"
+rustls = "0.21"
+tokio-rustls = "0.24"
+trust-dns-resolver = "0.21"
+rustls-pemfile = "1.0"
