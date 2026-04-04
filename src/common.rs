@@ -1,14 +1,17 @@
-use dns_parser::{RData, Class};
+use dns_parser::{Class, RData};
 use std::io::Write;
 
-pub fn serialize_resource_record(record: &dns_parser::ResourceRecord, buf: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn serialize_resource_record(
+    record: &dns_parser::ResourceRecord,
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Serializar el nombre del registro
     serialize_name(&record.name, buf)?;
 
     // Serializar el tipo y clase
     let record_type: u16 = match &record.data {
-        RData::A(_) => 1,       // Tipo A (IPv4)
-        RData::AAAA(_) => 28,   // Tipo AAAA (IPv6)
+        RData::A(_) => 1,     // Tipo A (IPv4)
+        RData::AAAA(_) => 28, // Tipo AAAA (IPv6)
         _ => return Err("Tipo de registro no soportado".into()),
     };
     buf.write_all(&record_type.to_be_bytes())?;
@@ -34,7 +37,10 @@ pub fn serialize_resource_record(record: &dns_parser::ResourceRecord, buf: &mut 
     Ok(())
 }
 
-fn serialize_name(name: &dns_parser::Name, buf: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+fn serialize_name(
+    name: &dns_parser::Name,
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let s = name.to_string();
     for label in s.split('.') {
         if !label.is_empty() {

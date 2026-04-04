@@ -1,8 +1,10 @@
-use dns_parser::{Packet, RData, ResourceRecord, Class};
+use crate::common::serialize_resource_record;
+use crate::resolver;
+use dns_parser::{Class, Packet, RData, ResourceRecord};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::net::UdpSocket;
-use crate::resolver;
-use crate::common::serialize_resource_record;
+
+const FALLBACK_IPV4: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
 
 pub async fn run_dns_server() -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:53").await?;
@@ -14,8 +16,20 @@ pub async fn run_dns_server() -> Result<(), Box<dyn std::error::Error>> {
         let (size, src) = socket.recv_from(&mut buf).await?;
         let query = &buf[..size];
 
+        if query.len() < 12 {
+            continue;
+        }
+
         if let Ok(packet) = Packet::parse(query) {
             println!("Consulta DNS recibida desde {:?}: {:?}", src, packet);
+
+            let Some(question) = packet.questions.first() else {
+                continue;
+            };
+
+            if packet.questions.len() != 1 {
+                continue;
+            }
 
             let mut response = Vec::new();
             response.extend_from_slice(&query[..2]); // ID de la consulta
@@ -29,8 +43,8 @@ pub async fn run_dns_server() -> Result<(), Box<dyn std::error::Error>> {
             response.extend_from_slice(&query[12..]);
 
             // Resolver recursivamente o usar una IP fija
-            let domain = packet.questions[0].qname.to_string();
-            let ip = resolver::resolve_recursively(&domain).unwrap_or_else(|| "192.168.1.1".parse().unwrap());
+            let domain = question.qname.to_string();
+            let ip = resolver::resolve_recursively(&domain).unwrap_or(IpAddr::V4(FALLBACK_IPV4));
 
             let rdata = match ip {
                 IpAddr::V4(ipv4) => RData::A(dns_parser::rdata::A(ipv4)),
@@ -38,9 +52,9 @@ pub async fn run_dns_server() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let record = ResourceRecord {
-                name: packet.questions[0].qname.clone(),
+                name: question.qname.clone(),
                 cls: Class::IN, // Clase IN (Internet)
-                ttl: 60,       // TTL
+                ttl: 60,        // TTL
                 data: rdata,
                 multicast_unique: false, // Campo multicast_unique
             };

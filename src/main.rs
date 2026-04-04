@@ -1,7 +1,7 @@
 mod common;
-mod server;
 mod dns_over_tls;
 mod resolver;
+mod server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
