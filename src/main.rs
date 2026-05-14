@@ -5,20 +5,22 @@ mod server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
     tokio::spawn(async {
         if let Err(e) = server::run_dns_server().await {
-            eprintln!("Error en el servidor DNS básico: {}", e);
+            eprintln!("DNS server error: {}", e);
         }
     });
 
     tokio::spawn(async {
         if let Err(e) = dns_over_tls::run_dot_server().await {
-            eprintln!("Error en el servidor DNS-over-TLS: {}", e);
+            eprintln!("DNS-over-TLS server error: {}", e);
         }
     });
 
-    println!("Servidores DNS iniciados. Presiona Ctrl+C para salir.");
+    println!("DNS servers started. Press Ctrl+C to exit.");
     tokio::signal::ctrl_c().await?;
-    println!("Apagando servidores...");
+    println!("Shutting down...");
     Ok(())
 }

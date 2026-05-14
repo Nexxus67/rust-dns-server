@@ -1,9 +1,13 @@
-use dns_parser::{Class, Packet, QueryType, RData, ResourceRecord};
+use dns_parser::{Packet, QueryType};
+use governor::clock::DefaultClock;
+use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys};
+use std::fs::File;
+use std::io::BufReader;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,11 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, instrument, warn};
 
-use crate::common::serialize_resource_record;
+use crate::common::{build_dns_response, DNS_HEADER_SIZE, FALLBACK_IPV4, FALLBACK_IPV6};
 use crate::resolver;
-
-const FALLBACK_IPV4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 1, 1);
-const FALLBACK_IPV6: std::net::Ipv6Addr = std::net::Ipv6Addr::LOCALHOST;
 
 struct Metrics {
     total_queries: AtomicUsize,
@@ -29,9 +30,10 @@ static METRICS: Metrics = Metrics {
     failed_parses: AtomicUsize::new(0),
 };
 
-static CACHE: Lazy<Mutex<LruCache<String, Vec<u8>>>> = Lazy::new(|| Mutex::new(LruCache::new(100)));
+static CACHE: Lazy<Mutex<LruCache<String, Vec<u8>>>> =
+    Lazy::new(|| Mutex::new(LruCache::new(100)));
 
-static RATE_LIMITER: Lazy<RateLimiter> = Lazy::new(|| {
+static RATE_LIMITER: Lazy<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> = Lazy::new(|| {
     let quota = Quota::per_second(NonZeroU32::new(100).unwrap());
     RateLimiter::direct(quota)
 });
@@ -43,16 +45,20 @@ pub async fn run_dot_server() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "60".to_string())
         .parse::<u32>()?;
 
-    let cert = include_bytes!("../certs/cert.pem");
-    let key = include_bytes!("../certs/key.pem");
+    let cert_path = std::env::var("DNS_CERT_PATH").unwrap_or_else(|_| "certs/cert.pem".to_string());
+    let key_path = std::env::var("DNS_KEY_PATH").unwrap_or_else(|_| "certs/key.pem".to_string());
 
-    let certs = certs(&mut &cert[..])?
+    let cert_file = File::open(&cert_path)
+        .map_err(|e| format!("Cannot open cert file '{}': {}", cert_path, e))?;
+    let key_file = File::open(&key_path)
+        .map_err(|e| format!("Cannot open key file '{}': {}", key_path, e))?;
+
+    let certs = certs(&mut BufReader::new(cert_file))?
         .into_iter()
         .map(Certificate)
         .collect::<Vec<_>>();
 
-    let mut key_reader = &key[..];
-    let keys = pkcs8_private_keys(&mut key_reader)?;
+    let keys = pkcs8_private_keys(&mut BufReader::new(key_file))?;
     let key = keys.into_iter().next().ok_or("Private key not found")?;
     let key = PrivateKey(key);
 
@@ -70,14 +76,14 @@ pub async fn run_dot_server() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, peer_addr) = listener.accept().await?;
         info!(%peer_addr, "New TLS connection established");
 
-        if RATE_LIMITER.check_one().is_err() {
+        if RATE_LIMITER.check().is_err() {
             warn!(%peer_addr, "Rate limit reached");
             continue;
         }
 
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_dot_connection(acceptor, stream, peer_addr).await {
+            if let Err(e) = handle_dot_connection(acceptor, stream, peer_addr, default_ttl).await {
                 error!(%peer_addr, error = %e, "Error handling DoT connection");
             }
         });
@@ -89,6 +95,7 @@ async fn handle_dot_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     peer_addr: std::net::SocketAddr,
+    ttl: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_stream = acceptor.accept(stream).await?;
     info!(%peer_addr, "TLS connection established");
@@ -97,7 +104,7 @@ async fn handle_dot_connection(
     tls_stream.read_exact(&mut len_bytes).await?;
     let len = u16::from_be_bytes(len_bytes) as usize;
 
-    if len < 12 {
+    if len < DNS_HEADER_SIZE {
         warn!(%peer_addr, len, "DNS-over-TLS query too short");
         return Ok(());
     }
@@ -116,43 +123,36 @@ async fn handle_dot_connection(
         }
     };
 
-    info!(%peer_addr, query = ?packet, "Received DNS-over-TLS query");
-
-    let Some(question) = packet.questions.first() else {
-        warn!(%peer_addr, "Packet has no questions");
-        return Ok(());
-    };
-
-    if packet.questions.len() != 1 {
+    let [question] = packet.questions.as_slice() else {
         warn!(%peer_addr, question_count = packet.questions.len(), "Unsupported question count");
         return Ok(());
-    }
+    };
 
     let domain = question.qname.to_string();
     info!(%peer_addr, %domain, "Processing DNS query");
 
-    match CACHE.lock() {
-        Ok(mut cache) => {
-            if let Some(response) = cache.get(&domain).cloned() {
-                info!(%peer_addr, %domain, "Served response from cache");
-                tls_stream.write_all(&response).await?;
-                return Ok(());
-            }
-        }
+    let cached = match CACHE.lock() {
+        Ok(mut cache) => cache.get(&domain).cloned(),
         Err(e) => {
             warn!(%peer_addr, error = %e, "DNS cache unavailable");
+            None
         }
+    };
+    if let Some(response) = cached {
+        info!(%peer_addr, %domain, "Served response from cache");
+        tls_stream.write_all(&response).await?;
+        return Ok(());
     }
 
     let response = match question.qtype {
         QueryType::A => {
             let ip = resolver::resolve_recursively(&domain).unwrap_or(IpAddr::V4(FALLBACK_IPV4));
             info!(%peer_addr, %domain, ip = %ip, "Resolved DNS A record");
-            build_dns_response(&buf, &question.qname, ip, 60)?
+            build_dns_response(&buf, &question.qname, ip, ttl)?
         }
         QueryType::AAAA => {
             let ip = IpAddr::V6(FALLBACK_IPV6);
-            build_dns_response(&buf, &question.qname, ip, 60)?
+            build_dns_response(&buf, &question.qname, ip, ttl)?
         }
         _ => {
             warn!(%peer_addr, %domain, qtype = ?question.qtype, "Unsupported query type");
@@ -175,43 +175,6 @@ async fn handle_dot_connection(
     info!(%peer_addr, %domain, "Response sent");
 
     Ok(())
-}
-
-fn build_dns_response(
-    query: &[u8],
-    qname: &dns_parser::Name,
-    ip: IpAddr,
-    ttl: u32,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if query.len() < 12 {
-        return Err("DNS query too short".into());
-    }
-
-    let mut response = Vec::new();
-    response.extend_from_slice(&query[..2]); // Transaction ID
-    response.push(0x81); // Flags: Standard query response
-    response.push(0x80);
-    response.extend_from_slice(&query[4..6]); // QDCOUNT
-    response.extend_from_slice(b"\x00\x01"); // ANCOUNT
-    response.extend_from_slice(b"\x00\x00"); // NSCOUNT
-    response.extend_from_slice(b"\x00\x00"); // ARCOUNT
-    response.extend_from_slice(&query[12..]); // Original question
-
-    let rdata = match ip {
-        IpAddr::V4(ipv4) => RData::A(dns_parser::rdata::A(ipv4)),
-        IpAddr::V6(ipv6) => RData::AAAA(dns_parser::rdata::Aaaa(ipv6)),
-    };
-
-    let record = ResourceRecord {
-        name: qname.clone(),
-        cls: Class::IN,
-        ttl,
-        data: rdata,
-        multicast_unique: false,
-    };
-
-    serialize_resource_record(&record, &mut response)?;
-    Ok(response)
 }
 
 fn frame_dns_message(message: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
