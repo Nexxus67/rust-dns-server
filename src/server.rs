@@ -1,68 +1,47 @@
-use crate::common::serialize_resource_record;
+use crate::common::{build_dns_response, DNS_HEADER_SIZE, DNS_UDP_BUFFER_SIZE, FALLBACK_IPV4};
 use crate::resolver;
-use dns_parser::{Class, Packet, RData, ResourceRecord};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use dns_parser::Packet;
+use std::net::IpAddr;
 use tokio::net::UdpSocket;
-
-const FALLBACK_IPV4: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+use tracing::{info, warn};
 
 pub async fn run_dns_server() -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:53").await?;
-    println!("Servidor DNS básico iniciado en 0.0.0.0:53");
+    info!("DNS server started on 0.0.0.0:53");
 
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; DNS_UDP_BUFFER_SIZE];
 
     loop {
         let (size, src) = socket.recv_from(&mut buf).await?;
         let query = &buf[..size];
 
-        if query.len() < 12 {
+        if query.len() < DNS_HEADER_SIZE {
             continue;
         }
 
-        if let Ok(packet) = Packet::parse(query) {
-            println!("Consulta DNS recibida desde {:?}: {:?}", src, packet);
+        let packet = match Packet::parse(query) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
 
-            let Some(question) = packet.questions.first() else {
-                continue;
-            };
+        let [question] = packet.questions.as_slice() else {
+            warn!(%src, question_count = packet.questions.len(), "Skipping packet with unexpected question count");
+            continue;
+        };
 
-            if packet.questions.len() != 1 {
+        info!(%src, domain = %question.qname, "Received DNS query");
+
+        let ip = resolver::resolve_recursively(&question.qname.to_string())
+            .unwrap_or(IpAddr::V4(FALLBACK_IPV4));
+
+        let response = match build_dns_response(query, &question.qname, ip, 60) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%src, error = %e, "Failed to build DNS response");
                 continue;
             }
+        };
 
-            let mut response = Vec::new();
-            response.extend_from_slice(&query[..2]); // ID de la consulta
-            response.push(0x81); // Flags: Respuesta estándar
-            response.push(0x80);
-            response.extend_from_slice(&query[4..6]); // QDCOUNT
-            response.extend_from_slice(b"\x00\x01"); // ANCOUNT (1 respuesta)
-            response.extend_from_slice(b"\x00\x00"); // NSCOUNT
-            response.extend_from_slice(b"\x00\x00"); // ARCOUNT
-
-            response.extend_from_slice(&query[12..]);
-
-            // Resolver recursivamente o usar una IP fija
-            let domain = question.qname.to_string();
-            let ip = resolver::resolve_recursively(&domain).unwrap_or(IpAddr::V4(FALLBACK_IPV4));
-
-            let rdata = match ip {
-                IpAddr::V4(ipv4) => RData::A(dns_parser::rdata::A(ipv4)),
-                IpAddr::V6(ipv6) => RData::AAAA(dns_parser::rdata::Aaaa(ipv6)),
-            };
-
-            let record = ResourceRecord {
-                name: question.qname.clone(),
-                cls: Class::IN, // Clase IN (Internet)
-                ttl: 60,        // TTL
-                data: rdata,
-                multicast_unique: false, // Campo multicast_unique
-            };
-
-            // Serializar manualmente el registro DNS
-            serialize_resource_record(&record, &mut response)?;
-
-            socket.send_to(&response, src).await?;
-        }
+        socket.send_to(&response, src).await?;
     }
 }

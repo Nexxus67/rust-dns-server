@@ -1,7 +1,9 @@
+use once_cell::sync::Lazy;
 use std::net::IpAddr;
 use trust_dns_resolver::Resolver;
 
+static RESOLVER: Lazy<Option<Resolver>> = Lazy::new(|| Resolver::default().ok());
+
 pub fn resolve_recursively(domain: &str) -> Option<IpAddr> {
-    let resolver = Resolver::default().ok()?;
-    resolver.lookup_ip(domain).ok()?.iter().next()
+    RESOLVER.as_ref()?.lookup_ip(domain).ok()?.iter().next()
 }
