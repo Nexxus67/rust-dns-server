@@ -146,7 +146,9 @@ async fn handle_dot_connection(
 
     let response = match question.qtype {
         QueryType::A => {
-            let ip = resolver::resolve_recursively(&domain).unwrap_or(IpAddr::V4(FALLBACK_IPV4));
+            let ip = resolver::resolve_recursively_async(domain.clone())
+                .await
+                .unwrap_or(IpAddr::V4(FALLBACK_IPV4));
             info!(%peer_addr, %domain, ip = %ip, "Resolved DNS A record");
             build_dns_response(&buf, &question.qname, ip, ttl)?
         }

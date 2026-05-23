@@ -19,7 +19,8 @@ pub fn build_dns_response(
         return Err("DNS query too short".into());
     }
 
-    let mut response = Vec::new();
+    // Header (12) + original question + one answer record (~16 + name).
+    let mut response = Vec::with_capacity(query.len() + 64);
     response.extend_from_slice(&query[..2]); // Transaction ID
     response.extend_from_slice(&DNS_FLAGS_STANDARD_RESPONSE);
     response.extend_from_slice(&query[4..6]); // QDCOUNT
