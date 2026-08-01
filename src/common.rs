@@ -35,7 +35,7 @@ pub fn build_dns_response(
     };
 
     let record = ResourceRecord {
-        name: qname.clone(),
+        name: *qname,
         cls: Class::IN,
         ttl,
         data: rdata,

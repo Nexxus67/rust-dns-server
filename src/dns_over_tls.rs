@@ -30,8 +30,7 @@ static METRICS: Metrics = Metrics {
     failed_parses: AtomicUsize::new(0),
 };
 
-static CACHE: Lazy<Mutex<LruCache<String, Vec<u8>>>> =
-    Lazy::new(|| Mutex::new(LruCache::new(100)));
+static CACHE: Lazy<Mutex<LruCache<String, Vec<u8>>>> = Lazy::new(|| Mutex::new(LruCache::new(100)));
 
 static RATE_LIMITER: Lazy<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> = Lazy::new(|| {
     let quota = Quota::per_second(NonZeroU32::new(100).unwrap());
@@ -50,8 +49,8 @@ pub async fn run_dot_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let cert_file = File::open(&cert_path)
         .map_err(|e| format!("Cannot open cert file '{}': {}", cert_path, e))?;
-    let key_file = File::open(&key_path)
-        .map_err(|e| format!("Cannot open key file '{}': {}", key_path, e))?;
+    let key_file =
+        File::open(&key_path).map_err(|e| format!("Cannot open key file '{}': {}", key_path, e))?;
 
     let certs = certs(&mut BufReader::new(cert_file))?
         .into_iter()
@@ -131,14 +130,23 @@ async fn handle_dot_connection(
     let domain = question.qname.to_string();
     info!(%peer_addr, %domain, "Processing DNS query");
 
+    // Key by name *and* type so A/AAAA queries don't collide in the cache.
+    let cache_key = format!("{}|{:?}", domain, question.qtype);
+
     let cached = match CACHE.lock() {
-        Ok(mut cache) => cache.get(&domain).cloned(),
+        Ok(mut cache) => cache.get(&cache_key).cloned(),
         Err(e) => {
             warn!(%peer_addr, error = %e, "DNS cache unavailable");
             None
         }
     };
-    if let Some(response) = cached {
+    if let Some(mut response) = cached {
+        // The cached bytes carry the original query's transaction ID; rewrite
+        // it with this query's ID so the client matches the response.
+        // Framed layout: [len: 2][txn id: 2][rest...].
+        if response.len() >= 4 {
+            response[2..4].copy_from_slice(&buf[0..2]);
+        }
         info!(%peer_addr, %domain, "Served response from cache");
         tls_stream.write_all(&response).await?;
         return Ok(());
@@ -166,7 +174,7 @@ async fn handle_dot_connection(
 
     match CACHE.lock() {
         Ok(mut cache) => {
-            cache.put(domain.clone(), framed_response.clone());
+            cache.put(cache_key, framed_response.clone());
         }
         Err(e) => {
             warn!(%peer_addr, error = %e, "DNS cache unavailable");
